@@ -132,6 +132,21 @@ If `allowed_models` is empty or omitted, all models are allowed on that GPU.
 }
 ```
 
+## Why Model Affinity and Admin Blocking Matter
+
+Ollama has a dangerous default behavior: when a consumer sends a request for a model that isn't currently loaded, Ollama silently **unloads the current model** and loads the requested one. There's no confirmation, no error, no warning -- it just swaps.
+
+On a multi-GPU setup where each GPU is pinned to a specific model, this is catastrophic:
+
+1. **VRAM thrashing** -- a single misrouted request can unload a 14B model that took 30 seconds to load, replacing it with a model that belongs on a different GPU.
+2. **Power spikes** -- loading a model is one of the most power-intensive GPU operations. An uncontrolled model swap on both GPUs simultaneously is exactly the kind of power spike that causes hard reboots.
+3. **Silent failure** -- the consumer gets a valid response (from the wrong GPU), so nobody notices the model was swapped until other requests start failing or performance degrades.
+
+AI Shaman prevents this in two ways:
+
+- **Model affinity** rejects requests for the wrong model *before they reach Ollama*, with a loud 403 that tells the consumer exactly which port to use instead.
+- **Blocked admin endpoints** (`/api/pull`, `/api/delete`, `/api/create`, `/api/copy`, `/api/push`) prevent consumers from triggering model downloads or deletions through the proxy. To manage models, connect directly to the internal Ollama ports (e.g., `curl http://localhost:11444/api/pull`).
+
 ## Systemd Service
 
 ```ini
