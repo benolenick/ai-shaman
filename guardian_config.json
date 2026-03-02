@@ -1,0 +1,31 @@
+{
+  "gpus": [
+    {
+      "id": 0,
+      "name": "qwen-gpu",
+      "listen_port": 11434,
+      "backend_port": 11444,
+      "max_concurrent": 1,
+      "temp_pause_c": 82,
+      "temp_resume_c": 75,
+      "power_limit_w": 200,
+      "allowed_models": ["qwen3:*", "qwen2.5:*"]
+    },
+    {
+      "id": 1,
+      "name": "gptoss-gpu",
+      "listen_port": 11435,
+      "backend_port": 11445,
+      "max_concurrent": 1,
+      "temp_pause_c": 82,
+      "temp_resume_c": 75,
+      "power_limit_w": 200,
+      "allowed_models": ["gpt-oss:*"]
+    }
+  ],
+  "combined_power_threshold_w": 350,
+  "monitor_interval_s": 3,
+  "queue_timeout_s": 300,
+  "log_file": "/home/om/ollama-guardian/guardian.log",
+  "management_port": 11450
+}
