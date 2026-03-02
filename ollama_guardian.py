@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-AI Shaman — Ollama GPU Guardian
+AI Shaman â€” Ollama GPU Guardian
 a'shamon: "Guardian" in the Old Tongue
 
 Async reverse proxy that sits between consumers and Ollama instances,
@@ -129,7 +129,7 @@ class GpuMonitor:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
         except asyncio.TimeoutError:
             proc.kill()
-            logging.error("nvidia-smi timed out (>10s) — GPU may be hung")
+            logging.error("nvidia-smi timed out (>10s) â€” GPU may be hung")
             return
         now = time.time()
         total_power = 0.0
@@ -178,7 +178,7 @@ class GpuGate:
         if not self.temp_tripped:
             self.temp_tripped = True
             self._resume_event.clear()
-            logging.warning(f"[{self.cfg.name}] TEMP CIRCUIT BREAKER TRIPPED — GPU {self.cfg.id} too hot")
+            logging.warning(f"[{self.cfg.name}] TEMP CIRCUIT BREAKER TRIPPED â€” GPU {self.cfg.id} too hot")
 
     def clear_temp(self):
         if self.temp_tripped:
@@ -191,7 +191,7 @@ class GpuGate:
         if not self.power_tripped:
             self.power_tripped = True
             self._resume_event.clear()
-            logging.warning(f"[{self.cfg.name}] POWER BUDGET EXCEEDED — queuing requests")
+            logging.warning(f"[{self.cfg.name}] POWER BUDGET EXCEEDED â€” queuing requests")
 
     def clear_power(self):
         if self.power_tripped:
@@ -282,7 +282,7 @@ QUEUED_PATHS = {
 }
 
 
-# Dangerous admin endpoints — blocked entirely at the proxy
+# Dangerous admin endpoints â€” blocked entirely at the proxy
 # These can load/unload/delete models, thrashing VRAM and bypassing affinity.
 BLOCKED_PATHS = {
     "/api/pull",
@@ -435,7 +435,7 @@ async def _proxy_request(request: web.Request, backend_port: int) -> web.StreamR
     headers = {}
     for k, v in request.headers.items():
         kl = k.lower()
-        if kl not in ("host", "transfer-encoding", "connection"):
+        if kl not in ("host", "transfer-encoding", "connection", "content-length"):
             headers[k] = v
 
     timeout = aiohttp.ClientTimeout(total=600, sock_read=600)
@@ -500,7 +500,7 @@ def _build_routing_table(config: Config) -> list[dict]:
         {
             "gpu": gcfg.name,
             "port": gcfg.listen_port,
-            "allowed_models": gcfg.allowed_models or ["(any — no restriction)"],
+            "allowed_models": gcfg.allowed_models or ["(any â€” no restriction)"],
         }
         for gcfg in config.gpus
     ]
@@ -517,7 +517,7 @@ def make_gpu_app(gate: GpuGate, monitor: GpuMonitor, config: Config,
         method = request.method
         gpu_stats = monitor.stats.get(gate.cfg.id)
 
-        # ── BLOCK DANGEROUS ADMIN ENDPOINTS ───────────────────────
+        # â”€â”€ BLOCK DANGEROUS ADMIN ENDPOINTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if path in BLOCKED_PATHS:
             logging.warning(
                 f"[{gate.cfg.name}] BLOCKED admin endpoint: {method} {path}"
@@ -535,16 +535,16 @@ def make_gpu_app(gate: GpuGate, monitor: GpuMonitor, config: Config,
                     f"directly on the internal port if you need admin operations."
                 ),
             }, status=403)
-        # ──────────────────────────────────────────────────────────
+        # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         # Extract model for logging and affinity check
         model = ""
         if method == "POST" and _is_queued(path):
             model = await _extract_model(request)
 
-        # ── MODEL AFFINITY CHECK ──────────────────────────────────
+        # â”€â”€ MODEL AFFINITY CHECK â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Fail CLOSED: if allowed_models is configured, model MUST be present and match.
-        # Empty/missing model field is rejected — no sneaking past affinity.
+        # Empty/missing model field is rejected â€” no sneaking past affinity.
         if method == "POST" and _is_queued(path) and gate.cfg.allowed_models:
             if not model:
                 gate.total_requests += 1
@@ -569,7 +569,7 @@ def make_gpu_app(gate: GpuGate, monitor: GpuMonitor, config: Config,
                     ),
                 }
                 logging.warning(
-                    f"[{gate.cfg.name}] MODEL REJECTED: empty/missing model field — returning 403"
+                    f"[{gate.cfg.name}] MODEL REJECTED: empty/missing model field â€” returning 403"
                 )
                 req_logger.log(gate.cfg.name, method, path, 403, 0.0,
                                gpu_stats.power_w if gpu_stats else 0.0, "")
@@ -613,12 +613,12 @@ def make_gpu_app(gate: GpuGate, monitor: GpuMonitor, config: Config,
 
                 logging.warning(
                     f"[{gate.cfg.name}] MODEL REJECTED: '{model}' not in "
-                    f"{gate.cfg.allowed_models} — returning 403"
+                    f"{gate.cfg.allowed_models} â€” returning 403"
                 )
                 req_logger.log(gate.cfg.name, method, path, 403, 0.0,
                                gpu_stats.power_w if gpu_stats else 0.0, model)
                 return web.json_response(rejection, status=403)
-        # ──────────────────────────────────────────────────────────
+        # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         start_time = time.time()
 
@@ -864,7 +864,7 @@ async def run_all(config: Config):
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, _signal_handler)
     else:
-        # Windows: use signal.signal() — works for SIGINT (Ctrl+C) and SIGTERM
+        # Windows: use signal.signal() â€” works for SIGINT (Ctrl+C) and SIGTERM
         signal.signal(signal.SIGINT, _signal_handler)
         signal.signal(signal.SIGTERM, _signal_handler)
 
@@ -907,3 +907,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
