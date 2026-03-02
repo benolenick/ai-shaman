@@ -433,6 +433,11 @@ def _inject_no_think(body: bytes, path: str) -> bytes:
                 "content": "Return final answer only. Do not include reasoning.",
             })
             data["messages"] = msgs
+        model = str(data.get("model") or "").lower()
+        if model.startswith("qwen"):
+            mt = data.get("max_tokens")
+            if not isinstance(mt, int) or mt < 512:
+                data["max_tokens"] = 512
 
     try:
         return json.dumps(data).encode("utf-8")
