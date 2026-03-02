@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -50,6 +51,8 @@ class Config:
     queue_timeout_s: float = 300.0
     log_file: str = "/home/om/ollama-guardian/guardian.log"
     management_port: int = 11450
+    clean_output: bool = True
+    request_no_think_hint: bool = True
 
     @classmethod
     def from_file(cls, path: str) -> "Config":
@@ -69,6 +72,8 @@ class Config:
             queue_timeout_s=raw.get("queue_timeout_s", 300.0),
             log_file=raw.get("log_file", cls.log_file),
             management_port=raw.get("management_port", 11450),
+            clean_output=raw.get("clean_output", True),
+            request_no_think_hint=raw.get("request_no_think_hint", True),
         )
 
 
@@ -328,12 +333,103 @@ async def _extract_model(request: web.Request) -> str:
         return ""
 
 
+def _dedupe_repeated_sentences(text: str) -> str:
+    """Collapse pathological repeated sentence tails."""
+    s = (text or "").strip()
+    if not s:
+        return s
+    # Split on sentence boundaries and drop immediate repeats.
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", s) if p.strip()]
+    if len(parts) <= 1:
+        return s
+    out = [parts[0]]
+    repeat_count = 0
+    for p in parts[1:]:
+        if p == out[-1]:
+            repeat_count += 1
+            # Keep at most one duplicate.
+            if repeat_count > 1:
+                continue
+        else:
+            repeat_count = 0
+        out.append(p)
+    return " ".join(out)
+
+
+def _sanitize_json_payload(payload: dict | list, path: str) -> dict | list:
+    """Remove noisy reasoning fields and tame repetition in final content."""
+    if not isinstance(payload, dict):
+        return payload
+
+    # OpenAI-compatible /v1/chat/completions
+    if path == "/v1/chat/completions":
+        for choice in payload.get("choices", []) if isinstance(payload.get("choices"), list) else []:
+            if not isinstance(choice, dict):
+                continue
+            msg = choice.get("message")
+            if not isinstance(msg, dict):
+                continue
+            msg.pop("reasoning", None)
+            content = msg.get("content")
+            if isinstance(content, str):
+                msg["content"] = _dedupe_repeated_sentences(content)
+
+    # Ollama /api/chat non-stream JSON shape
+    if path == "/api/chat":
+        msg = payload.get("message")
+        if isinstance(msg, dict):
+            msg.pop("thinking", None)
+            content = msg.get("content")
+            if isinstance(content, str):
+                msg["content"] = _dedupe_repeated_sentences(content)
+
+    # Ollama /api/generate non-stream JSON shape
+    if path == "/api/generate":
+        if isinstance(payload.get("response"), str):
+            payload["response"] = _dedupe_repeated_sentences(payload["response"])
+        payload.pop("thinking", None)
+
+    return payload
+
+
+def _inject_no_think(body: bytes, path: str) -> bytes:
+    """Best-effort request hint to suppress reasoning/thinking output."""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except Exception:
+        return body
+    if not isinstance(data, dict):
+        return body
+
+    if path in {"/api/chat", "/api/generate"}:
+        # Ollama-native endpoints accept this hint on recent versions.
+        data.setdefault("think", False)
+
+    if path == "/v1/chat/completions":
+        msgs = data.get("messages")
+        if isinstance(msgs, list):
+            msgs.insert(0, {
+                "role": "system",
+                "content": "Return final answer only. Do not include reasoning.",
+            })
+            data["messages"] = msgs
+
+    try:
+        return json.dumps(data).encode("utf-8")
+    except Exception:
+        return body
+
+
 async def _proxy_request(request: web.Request, backend_port: int) -> web.StreamResponse:
     """Proxy a request to the backend Ollama and stream the response back."""
     backend_url = f"http://127.0.0.1:{backend_port}{request.path_qs}"
 
     # Read the body once
     body = await request.read()
+    if request.method == "POST":
+        app_cfg = request.app.get("guardian_config")
+        if app_cfg and app_cfg.request_no_think_hint and _is_queued(request.path):
+            body = _inject_no_think(body, request.path)
 
     # Build headers, filtering hop-by-hop
     headers = {}
@@ -372,6 +468,16 @@ async def _proxy_request(request: web.Request, backend_port: int) -> web.StreamR
                 else:
                     # Non-streaming: read full body
                     resp_body = await backend_resp.read()
+                    app_cfg = request.app.get("guardian_config")
+                    if app_cfg and app_cfg.clean_output:
+                        ct = backend_resp.headers.get("Content-Type", "")
+                        if "application/json" in ct:
+                            try:
+                                parsed = json.loads(resp_body.decode("utf-8"))
+                                cleaned = _sanitize_json_payload(parsed, request.path)
+                                resp_body = json.dumps(cleaned).encode("utf-8")
+                            except Exception:
+                                pass
                     resp = web.Response(
                         status=backend_resp.status,
                         body=resp_body,
@@ -553,6 +659,7 @@ def make_gpu_app(gate: GpuGate, monitor: GpuMonitor, config: Config,
             return resp
 
     app = web.Application()
+    app["guardian_config"] = config
     app.router.add_route("*", "/{path_info:.*}", handle_request)
     return app
 

@@ -43,6 +43,7 @@ Consumers (apps, agents, scripts)
 - **Model affinity** -- pin specific models to specific GPUs. Wrong model = loud 403 rejection with routing instructions. Empty/missing model field = rejected (fail-closed).
 - **Blocked admin endpoints** -- `/api/pull`, `/api/delete`, `/api/create`, `/api/copy`, `/api/push` are blocked at the proxy to prevent VRAM thrashing.
 - **Transparent streaming** -- SSE and NDJSON responses proxied chunk-by-chunk. Consumers see no difference.
+- **Clean-output mode (non-stream JSON)** -- strips `reasoning` / `thinking` fields and de-dupes repeated sentence tails.
 - **Management API** (localhost-only) -- `/guardian/status`, `/guardian/metrics`, `/guardian/pause`, `/guardian/resume`
 - **Full request logging** -- timestamp, GPU, model, HTTP status, latency, power draw at request time.
 - **nvidia-smi monitoring** -- polls every 3s with 10s timeout (won't hang if GPU driver locks up).
@@ -98,6 +99,8 @@ python ollama_guardian.py
   "combined_power_threshold_w": 350,
   "monitor_interval_s": 3,
   "queue_timeout_s": 300,
+  "clean_output": true,
+  "request_no_think_hint": true,
   "log_file": "/path/to/guardian.log",
   "management_port": 11450
 }
@@ -110,6 +113,15 @@ python ollama_guardian.py
 - `"qwen3"` -- bare name, matches all tags (same as `qwen3:*`)
 
 If `allowed_models` is empty or omitted, all models are allowed on that GPU.
+
+### Clean Output Controls
+
+- `clean_output` (default `true`): for non-streaming JSON responses, removes backend reasoning/thinking fields and trims repeated sentence loops.
+- `request_no_think_hint` (default `true`): adds best-effort hints to reduce thinking output on queued POST endpoints.
+
+Notes:
+- Streaming responses are passed through unchanged by design.
+- These controls sanitize output shape/noise but do not change model quality itself.
 
 ## What Happens on Wrong Model
 
