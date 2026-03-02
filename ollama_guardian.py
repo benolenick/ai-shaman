@@ -343,17 +343,29 @@ def _dedupe_repeated_sentences(text: str) -> str:
     if len(parts) <= 1:
         return s
     out = [parts[0]]
-    repeat_count = 0
     for p in parts[1:]:
         if p == out[-1]:
-            repeat_count += 1
-            # Keep at most one duplicate.
-            if repeat_count > 1:
-                continue
-        else:
-            repeat_count = 0
+            continue
         out.append(p)
-    return " ".join(out)
+    cleaned = " ".join(out).strip()
+    # Trim dangling unfinished tails from token cutoffs.
+    cleaned = re.sub(r"(The answer is|Answer:)\s*$", "", cleaned, flags=re.IGNORECASE).strip()
+    return cleaned
+
+
+def _reasoning_fallback(reasoning: str) -> str:
+    r = (reasoning or "").strip()
+    if not r:
+        return ""
+    # Try to recover an explicit "answer is ..." style sentence first.
+    m = re.findall(r"([^.?!]*answer[^.?!]*[.?!])", r, flags=re.IGNORECASE)
+    if m:
+        return _dedupe_repeated_sentences(m[-1]).strip()
+    # Otherwise use the last substantial sentence.
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", r) if p.strip()]
+    if parts:
+        return _dedupe_repeated_sentences(parts[-1]).strip()
+    return ""
 
 
 def _sanitize_json_payload(payload: dict | list, path: str) -> dict | list:
@@ -369,19 +381,27 @@ def _sanitize_json_payload(payload: dict | list, path: str) -> dict | list:
             msg = choice.get("message")
             if not isinstance(msg, dict):
                 continue
+            reasoning = str(msg.get("reasoning") or "")
             msg.pop("reasoning", None)
             content = msg.get("content")
             if isinstance(content, str):
-                msg["content"] = _dedupe_repeated_sentences(content)
+                cleaned = _dedupe_repeated_sentences(content)
+                if not cleaned and reasoning:
+                    cleaned = _reasoning_fallback(reasoning)
+                msg["content"] = cleaned
 
     # Ollama /api/chat non-stream JSON shape
     if path == "/api/chat":
         msg = payload.get("message")
         if isinstance(msg, dict):
+            thinking = str(msg.get("thinking") or "")
             msg.pop("thinking", None)
             content = msg.get("content")
             if isinstance(content, str):
-                msg["content"] = _dedupe_repeated_sentences(content)
+                cleaned = _dedupe_repeated_sentences(content)
+                if not cleaned and thinking:
+                    cleaned = _reasoning_fallback(thinking)
+                msg["content"] = cleaned
 
     # Ollama /api/generate non-stream JSON shape
     if path == "/api/generate":
