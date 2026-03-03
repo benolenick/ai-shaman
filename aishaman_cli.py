@@ -253,6 +253,39 @@ def _model_exists_on_gpu(status: dict[str, Any], gpu_id: int, model: str) -> boo
     return model in names
 
 
+def _swap_preflight(status: dict[str, Any], gpu_id: int, power_headroom_min: float = 0.10) -> dict[str, Any]:
+    gpu = _find_gpu(status, gpu_id)
+    issues: list[str] = []
+    queue_depth = int(gpu.get("queue_depth", 0) or 0)
+    if queue_depth > 0:
+        issues.append(f"GPU {gpu_id} has queue_depth={queue_depth}")
+    if bool(gpu.get("temp_tripped")):
+        issues.append(f"GPU {gpu_id} temp circuit breaker is tripped")
+    if bool(gpu.get("power_tripped")):
+        issues.append(f"GPU {gpu_id} power circuit breaker is tripped")
+    if bool(gpu.get("paused")):
+        issues.append(f"GPU {gpu_id} is manually paused")
+    if bool(gpu.get("maintenance_locked")):
+        issues.append(f"GPU {gpu_id} is already maintenance locked")
+
+    combined = float(status.get("combined_power_w", 0.0) or 0.0)
+    threshold = float(status.get("combined_power_threshold_w", 0.0) or 0.0)
+    if threshold > 0:
+        ratio = combined / threshold
+        if ratio >= (1.0 - power_headroom_min):
+            issues.append(
+                f"Combined power is high ({combined:.1f}W/{threshold:.1f}W, {ratio:.0%})"
+            )
+
+    return {
+        "ok": len(issues) == 0,
+        "gpu_id": gpu_id,
+        "issues": issues,
+        "combined_power_w": combined,
+        "combined_power_threshold_w": threshold,
+    }
+
+
 def _run_swap(
     client: AiShamanClient,
     gpu_id: int,
@@ -262,11 +295,24 @@ def _run_swap(
     pull_mode: str,
     skip_probe: bool,
     reason: str,
+    force: bool = False,
     confirm_download: Callable[[str, int], bool] | None = None,
 ) -> dict[str, Any]:
     timeline: list[dict[str, Any]] = []
     locked = False
     try:
+        status = client.status()
+        preflight = _swap_preflight(status, gpu_id)
+        timeline.append({"step": "preflight", "status": "ok" if preflight["ok"] else "blocked", "result": preflight})
+        if not preflight["ok"] and not force:
+            return {
+                "ok": False,
+                "gpu_id": gpu_id,
+                "target_model": target_model,
+                "error": "Swap blocked by preflight safety checks. Re-run with --force to override.",
+                "timeline": timeline,
+            }
+
         timeline.append({"step": "lock", "status": "start"})
         lock_res = client.lock(gpu_id, reason)
         timeline.append({"step": "lock", "status": "ok", "result": lock_res})
@@ -386,6 +432,7 @@ def _interactive_menu(client: AiShamanClient) -> int:
                 if pm not in {"auto", "always", "never"}:
                     raise CliError("Pull mode must be one of: auto, always, never")
                 skip_probe = input("Skip probe step? [y/N]: ").strip().lower() in {"y", "yes"}
+                force = input("Force swap even if preflight warns? [y/N]: ").strip().lower() in {"y", "yes"}
                 reason = input("Lock reason [guided swap]: ").strip() or "guided swap"
 
                 def ask_download(model: str, gid: int) -> bool:
@@ -403,6 +450,7 @@ def _interactive_menu(client: AiShamanClient) -> int:
                     pm,
                     skip_probe,
                     reason,
+                    force=force,
                     confirm_download=ask_download,
                 )
                 _print_result(res, as_json=False)
@@ -455,6 +503,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="auto=only pull if missing, always=always pull, never=never pull",
     )
     swap.add_argument("--skip-probe", action="store_true", help="Skip probe step")
+    swap.add_argument("--force", action="store_true", help="Bypass swap preflight safety block")
     swap.add_argument("--reason", default="model swap", help="Maintenance lock reason")
 
     return p
@@ -505,6 +554,7 @@ def main(argv: list[str] | None = None) -> int:
                 pull_mode=args.pull_mode,
                 skip_probe=args.skip_probe,
                 reason=args.reason,
+                force=args.force,
             )
         else:
             raise CliError(f"Unsupported command: {args.cmd}")

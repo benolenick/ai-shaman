@@ -214,6 +214,7 @@ aishaman unlock --gpu 1 --json
 ```
 
 The `swap` workflow performs:
+0. Preflight safety check (queue/circuit-breaker/lock/high-power guard)
 1. Maintenance lock
 2. Smart pull behavior on backend (`--pull-mode`):
    - `auto` (default): check local models first, pull only if missing
@@ -224,6 +225,7 @@ The `swap` workflow performs:
 5. Unlock
 
 If a step fails, it attempts automatic unlock.
+If preflight blocks the swap, re-run with `--force` only when you intentionally want to override safety checks.
 
 Interactive mode prompts before downloading when `pull-mode` is `auto` and the model is missing.
 
