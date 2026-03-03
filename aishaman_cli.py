@@ -175,6 +175,66 @@ def _print_result(result: dict[str, Any], as_json: bool) -> None:
             print(f"{k}: {v}")
 
 
+def _gpu_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
+    gpus = status.get("gpus", [])
+    rows: list[dict[str, Any]] = []
+    for idx, gpu in enumerate(gpus, start=1):
+        rows.append({
+            "opt": idx,
+            "id": gpu.get("id"),
+            "name": gpu.get("name"),
+            "listen_port": gpu.get("listen_port"),
+            "backend_port": gpu.get("backend_port"),
+            "allowed_models": gpu.get("allowed_models") or ["(any)"],
+        })
+    return rows
+
+
+def _print_gpu_choices(status: dict[str, Any]) -> None:
+    rows = _gpu_rows(status)
+    if not rows:
+        print("No GPUs reported by guardian.")
+        return
+    print("GPU choices:")
+    for r in rows:
+        print(
+            f"  [{r['opt']}] id={r['id']}  {r['name']}  "
+            f"proxy:{r['listen_port']} backend:{r['backend_port']}  "
+            f"models:{','.join(r['allowed_models'])}"
+        )
+
+
+def _interactive_pick_gpu_id(status: dict[str, Any], allow_all: bool = False) -> int | None:
+    rows = _gpu_rows(status)
+    if not rows:
+        raise CliError("No GPUs available from status")
+    _print_gpu_choices(status)
+    prompt = "Pick GPU option number or GPU id"
+    if allow_all:
+        prompt += " (or 'all')"
+    prompt += ": "
+    raw = input(prompt).strip().lower()
+    if allow_all and raw in {"all", "*", ""}:
+        return None
+    if not raw:
+        raise CliError("Selection required")
+
+    for r in rows:
+        if raw == str(r["opt"]) or raw == str(r["id"]):
+            return int(r["id"])
+    raise CliError(f"Unknown GPU selection: {raw}")
+
+
+def _models_list_all(status: dict[str, Any]) -> dict[str, Any]:
+    out: list[dict[str, Any]] = []
+    for gpu in status.get("gpus", []):
+        gid = int(gpu.get("id"))
+        name = str(gpu.get("name"))
+        tags = _models_list(status, gid)
+        out.append({"gpu_id": gid, "gpu_name": name, "models": tags.get("models", [])})
+    return {"gpus": out}
+
+
 def _run_swap(
     client: AiShamanClient,
     gpu_id: int,
@@ -230,34 +290,45 @@ def _run_swap(
 def _interactive_menu(client: AiShamanClient) -> int:
     while True:
         print("\nAI Shaman Console")
-        print("1. View status")
-        print("2. Health check")
-        print("3. Lock GPU")
-        print("4. Unlock GPU")
-        print("5. List models on GPU backend")
-        print("6. Guided swap workflow")
+        print("1. View status (temps, power, queue, lock states)")
+        print("2. Health check (quick pass/fail + issue list)")
+        print("3. Lock GPU (block requests on selected proxy port during maintenance)")
+        print("4. Unlock GPU (resume requests after maintenance)")
+        print("5. List models on GPU backend (what Ollama actually has on each card)")
+        print("6. Guided swap workflow (lock -> pull -> optional delete old -> probe -> unlock)")
         print("7. Exit")
-        choice = input("Choose [1-7]: ").strip()
         try:
+            choice = input("Choose [1-7] (or q to quit): ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting AI Shaman Console.")
+            return 0
+        try:
+            if choice in {"7", "q", "quit", "exit"}:
+                return 0
             if choice == "1":
                 _print_result(client.status(), as_json=False)
             elif choice == "2":
                 _print_result(client.health(), as_json=False)
             elif choice == "3":
-                raw = input("GPU id (blank for all): ").strip()
-                gpu_id = int(raw) if raw else None
+                st = client.status()
+                gpu_id = _interactive_pick_gpu_id(st, allow_all=True)
                 reason = input("Reason [manual maintenance]: ").strip() or "manual maintenance"
                 _print_result(client.lock(gpu_id, reason), as_json=False)
             elif choice == "4":
-                raw = input("GPU id (blank for all): ").strip()
-                gpu_id = int(raw) if raw else None
+                st = client.status()
+                gpu_id = _interactive_pick_gpu_id(st, allow_all=True)
                 _print_result(client.unlock(gpu_id), as_json=False)
             elif choice == "5":
-                gpu_id = int(input("GPU id: ").strip())
                 st = client.status()
-                _print_result(_models_list(st, gpu_id), as_json=False)
+                print("Select one GPU, or type 'all' to list models for every backend.")
+                sel = _interactive_pick_gpu_id(st, allow_all=True)
+                if sel is None:
+                    _print_result(_models_list_all(st), as_json=False)
+                else:
+                    _print_result(_models_list(st, sel), as_json=False)
             elif choice == "6":
-                gpu_id = int(input("GPU id: ").strip())
+                st = client.status()
+                gpu_id = _interactive_pick_gpu_id(st, allow_all=False)
                 target = input("Target model (e.g. qwen3.5:latest): ").strip()
                 old = input("Old model to delete (optional): ").strip() or None
                 keep_old = input("Keep old model? [y/N]: ").strip().lower() in {"y", "yes"}
@@ -266,8 +337,6 @@ def _interactive_menu(client: AiShamanClient) -> int:
                 reason = input("Lock reason [guided swap]: ").strip() or "guided swap"
                 res = _run_swap(client, gpu_id, target, old, keep_old, skip_pull, skip_probe, reason)
                 _print_result(res, as_json=False)
-            elif choice == "7":
-                return 0
             else:
                 print("Invalid choice.")
         except Exception as e:
@@ -283,20 +352,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="cmd")
 
-    sub.add_parser("status", help="Show guardian status", parents=[common])
+    sub.add_parser("status", help="Show guardian status (temps/power/queues/lock states)", parents=[common])
     sub.add_parser("health", help="Run health check", parents=[common])
+    sub.add_parser("gpus", help="Show GPU ids and ports for selection", parents=[common])
 
-    lock = sub.add_parser("lock", help="Enable maintenance lock", parents=[common])
-    lock.add_argument("--gpu", type=int, default=None, help="GPU id (omit for all)")
+    lock = sub.add_parser("lock", help="Enable maintenance lock (blocks new requests on selected GPU proxy)", parents=[common])
+    lock.add_argument("--gpu", type=int, default=None, help="GPU id (omit for all GPUs)")
     lock.add_argument("--reason", default="manual maintenance", help="Lock reason")
 
-    unlock = sub.add_parser("unlock", help="Disable maintenance lock", parents=[common])
-    unlock.add_argument("--gpu", type=int, default=None, help="GPU id (omit for all)")
+    unlock = sub.add_parser("unlock", help="Disable maintenance lock (resume traffic)", parents=[common])
+    unlock.add_argument("--gpu", type=int, default=None, help="GPU id (omit for all GPUs)")
 
-    models = sub.add_parser("models", help="Manage backend models directly", parents=[common])
+    models = sub.add_parser("models", help="Manage backend models directly on each GPU's Ollama backend port", parents=[common])
     models_sub = models.add_subparsers(dest="models_cmd", required=True)
     m_list = models_sub.add_parser("list", help="List models on GPU backend", parents=[common])
-    m_list.add_argument("--gpu", type=int, required=True)
+    m_list.add_argument("--gpu", type=int, required=False, help="GPU id (omit to list all GPUs)")
     m_pull = models_sub.add_parser("pull", help="Pull model on GPU backend", parents=[common])
     m_pull.add_argument("--gpu", type=int, required=True)
     m_pull.add_argument("--model", required=True)
@@ -304,7 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
     m_del.add_argument("--gpu", type=int, required=True)
     m_del.add_argument("--model", required=True)
 
-    swap = sub.add_parser("swap", help="Safe swap workflow (lock -> pull -> probe -> unlock)", parents=[common])
+    swap = sub.add_parser("swap", help="Safe swap workflow (lock -> pull -> optional delete old -> probe -> unlock)", parents=[common])
     swap.add_argument("--gpu", type=int, required=True)
     swap.add_argument("--to", required=True, help="Target model")
     swap.add_argument("--from-model", default=None, help="Old model to delete")
@@ -331,6 +401,9 @@ def main(argv: list[str] | None = None) -> int:
             res = client.status()
         elif args.cmd == "health":
             res = client.health()
+        elif args.cmd == "gpus":
+            st = client.status()
+            res = {"gpus": _gpu_rows(st)}
         elif args.cmd == "lock":
             res = client.lock(args.gpu, args.reason)
         elif args.cmd == "unlock":
@@ -338,7 +411,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "models":
             st = client.status()
             if args.models_cmd == "list":
-                res = _models_list(st, args.gpu)
+                if args.gpu is None:
+                    res = _models_list_all(st)
+                else:
+                    res = _models_list(st, args.gpu)
             elif args.models_cmd == "pull":
                 res = _models_pull(st, args.gpu, args.model)
             elif args.models_cmd == "delete":
