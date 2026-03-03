@@ -165,6 +165,8 @@ class GpuGate:
         self.cfg = gpu_cfg
         self.semaphore = asyncio.Semaphore(gpu_cfg.max_concurrent)
         self.paused = False           # manual pause
+        self.maintenance_locked = False  # hard block during model swap/maintenance
+        self.maintenance_reason = ""
         self.temp_tripped = False     # auto-pause from temperature
         self.power_tripped = False    # auto-pause from combined power
         self.queue_depth = 0
@@ -207,13 +209,29 @@ class GpuGate:
 
     def manual_resume(self):
         self.paused = False
-        if not self.temp_tripped and not self.power_tripped:
+        if not self.temp_tripped and not self.power_tripped and not self.maintenance_locked:
             self._resume_event.set()
         logging.info(f"[{self.cfg.name}] Manually resumed")
 
+    def maintenance_lock(self, reason: str = ""):
+        self.maintenance_locked = True
+        self.maintenance_reason = reason or ""
+        self._resume_event.clear()
+        logging.warning(
+            f"[{self.cfg.name}] Maintenance lock enabled"
+            + (f": {self.maintenance_reason}" if self.maintenance_reason else "")
+        )
+
+    def maintenance_unlock(self):
+        self.maintenance_locked = False
+        self.maintenance_reason = ""
+        if not self.paused and not self.temp_tripped and not self.power_tripped:
+            self._resume_event.set()
+        logging.info(f"[{self.cfg.name}] Maintenance lock disabled")
+
     @property
     def is_blocked(self) -> bool:
-        return self.paused or self.temp_tripped or self.power_tripped
+        return self.paused or self.temp_tripped or self.power_tripped or self.maintenance_locked
 
     async def acquire(self, timeout: float):
         """Wait for circuit breaker + semaphore. Raises TimeoutError."""
@@ -541,6 +559,32 @@ def make_gpu_app(gate: GpuGate, monitor: GpuMonitor, config: Config,
         path = request.path
         method = request.method
         gpu_stats = monitor.stats.get(gate.cfg.id)
+        if gate.maintenance_locked:
+            gate.total_requests += 1
+            gate.total_errors += 1
+            req_logger.log(
+                gate.cfg.name,
+                method,
+                path,
+                503,
+                0.0,
+                gpu_stats.power_w if gpu_stats else 0.0,
+                "",
+            )
+            return web.json_response({
+                "error": "GPU PORT LOCKED FOR MAINTENANCE",
+                "guardian": "ai-shaman",
+                "gpu": {
+                    "id": gate.cfg.id,
+                    "name": gate.cfg.name,
+                    "port": gate.cfg.listen_port,
+                },
+                "message": (
+                    "This GPU proxy is temporarily locked to prevent requests "
+                    "during model swap or maintenance."
+                ),
+                "reason": gate.maintenance_reason or "model swap in progress",
+            }, status=503)
 
         # â”€â”€ BLOCK DANGEROUS ADMIN ENDPOINTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if path in BLOCKED_PATHS:
@@ -720,6 +764,8 @@ def make_management_app(gates: dict[int, GpuGate], monitor: GpuMonitor,
                 "temp_tripped": gate.temp_tripped,
                 "power_tripped": gate.power_tripped,
                 "paused": gate.paused,
+                "maintenance_locked": gate.maintenance_locked,
+                "maintenance_reason": gate.maintenance_reason,
             })
         return web.json_response({
             "guardian": "AI Shaman",
@@ -783,11 +829,50 @@ def make_management_app(gates: dict[int, GpuGate], monitor: GpuMonitor,
         gates[gpu_id].manual_resume()
         return web.json_response({"status": f"GPU {gpu_id} resumed"})
 
+    async def maintenance_lock_handler(request: web.Request) -> web.Response:
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        gpu_id = data.get("gpu_id")
+        reason = data.get("reason", "model swap in progress")
+        if gpu_id is None:
+            for gate in gates.values():
+                gate.maintenance_lock(reason)
+            return web.json_response({
+                "status": "maintenance lock enabled for all GPUs",
+                "reason": reason,
+            })
+        if gpu_id not in gates:
+            return web.json_response({"error": f"Unknown GPU {gpu_id}"}, status=404)
+        gates[gpu_id].maintenance_lock(reason)
+        return web.json_response({
+            "status": f"maintenance lock enabled for GPU {gpu_id}",
+            "reason": reason,
+        })
+
+    async def maintenance_unlock_handler(request: web.Request) -> web.Response:
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        gpu_id = data.get("gpu_id")
+        if gpu_id is None:
+            for gate in gates.values():
+                gate.maintenance_unlock()
+            return web.json_response({"status": "maintenance lock disabled for all GPUs"})
+        if gpu_id not in gates:
+            return web.json_response({"error": f"Unknown GPU {gpu_id}"}, status=404)
+        gates[gpu_id].maintenance_unlock()
+        return web.json_response({"status": f"maintenance lock disabled for GPU {gpu_id}"})
+
     app = web.Application()
     app.router.add_get("/guardian/status", status_handler)
     app.router.add_get("/guardian/metrics", metrics_handler)
     app.router.add_post("/guardian/pause", pause_handler)
     app.router.add_post("/guardian/resume", resume_handler)
+    app.router.add_post("/guardian/maintenance/lock", maintenance_lock_handler)
+    app.router.add_post("/guardian/maintenance/unlock", maintenance_unlock_handler)
     return app
 
 
