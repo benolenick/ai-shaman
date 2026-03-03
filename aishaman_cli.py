@@ -19,7 +19,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 
 DEFAULT_MGMT_URL = "http://127.0.0.1:11450"
@@ -235,15 +235,34 @@ def _models_list_all(status: dict[str, Any]) -> dict[str, Any]:
     return {"gpus": out}
 
 
+def _model_names(tags_payload: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    for m in tags_payload.get("models", []):
+        n = m.get("name")
+        if isinstance(n, str) and n:
+            names.add(n)
+        n2 = m.get("model")
+        if isinstance(n2, str) and n2:
+            names.add(n2)
+    return names
+
+
+def _model_exists_on_gpu(status: dict[str, Any], gpu_id: int, model: str) -> bool:
+    tags = _models_list(status, gpu_id)
+    names = _model_names(tags)
+    return model in names
+
+
 def _run_swap(
     client: AiShamanClient,
     gpu_id: int,
     target_model: str,
     old_model: str | None,
     keep_old: bool,
-    skip_pull: bool,
+    pull_mode: str,
     skip_probe: bool,
     reason: str,
+    confirm_download: Callable[[str, int], bool] | None = None,
 ) -> dict[str, Any]:
     timeline: list[dict[str, Any]] = []
     locked = False
@@ -256,7 +275,38 @@ def _run_swap(
 
         status = client.status()
 
-        if not skip_pull:
+        if pull_mode not in {"auto", "always", "never"}:
+            raise CliError(f"Invalid pull_mode: {pull_mode}")
+
+        should_pull = False
+        if pull_mode == "always":
+            should_pull = True
+            timeline.append({"step": "pull_decision", "mode": "always", "decision": "pull"})
+        elif pull_mode == "never":
+            timeline.append({"step": "pull_decision", "mode": "never", "decision": "skip"})
+        else:
+            exists = _model_exists_on_gpu(status, gpu_id, target_model)
+            if exists:
+                timeline.append({
+                    "step": "pull_decision",
+                    "mode": "auto",
+                    "decision": "skip",
+                    "reason": "model already present on backend",
+                })
+            else:
+                if confirm_download is not None:
+                    approved = bool(confirm_download(target_model, gpu_id))
+                    if not approved:
+                        raise CliError("Swap cancelled by operator before model download")
+                should_pull = True
+                timeline.append({
+                    "step": "pull_decision",
+                    "mode": "auto",
+                    "decision": "pull",
+                    "reason": "model missing on backend",
+                })
+
+        if should_pull:
             timeline.append({"step": "pull", "status": "start", "model": target_model})
             pull_res = _models_pull(status, gpu_id, target_model)
             timeline.append({"step": "pull", "status": "ok", "result": pull_res})
@@ -332,10 +382,29 @@ def _interactive_menu(client: AiShamanClient) -> int:
                 target = input("Target model (e.g. qwen3.5:latest): ").strip()
                 old = input("Old model to delete (optional): ").strip() or None
                 keep_old = input("Keep old model? [y/N]: ").strip().lower() in {"y", "yes"}
-                skip_pull = input("Skip pull step? [y/N]: ").strip().lower() in {"y", "yes"}
+                pm = (input("Pull mode [auto/always/never] (default auto): ").strip().lower() or "auto")
+                if pm not in {"auto", "always", "never"}:
+                    raise CliError("Pull mode must be one of: auto, always, never")
                 skip_probe = input("Skip probe step? [y/N]: ").strip().lower() in {"y", "yes"}
                 reason = input("Lock reason [guided swap]: ").strip() or "guided swap"
-                res = _run_swap(client, gpu_id, target, old, keep_old, skip_pull, skip_probe, reason)
+
+                def ask_download(model: str, gid: int) -> bool:
+                    ans = input(
+                        f"Model '{model}' is missing on GPU {gid}. Download now? [y/N]: "
+                    ).strip().lower()
+                    return ans in {"y", "yes"}
+
+                res = _run_swap(
+                    client,
+                    gpu_id,
+                    target,
+                    old,
+                    keep_old,
+                    pm,
+                    skip_probe,
+                    reason,
+                    confirm_download=ask_download,
+                )
                 _print_result(res, as_json=False)
             else:
                 print("Invalid choice.")
@@ -379,7 +448,12 @@ def build_parser() -> argparse.ArgumentParser:
     swap.add_argument("--to", required=True, help="Target model")
     swap.add_argument("--from-model", default=None, help="Old model to delete")
     swap.add_argument("--keep-old", action="store_true", help="Do not delete old model")
-    swap.add_argument("--skip-pull", action="store_true", help="Skip pull step")
+    swap.add_argument(
+        "--pull-mode",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="auto=only pull if missing, always=always pull, never=never pull",
+    )
     swap.add_argument("--skip-probe", action="store_true", help="Skip probe step")
     swap.add_argument("--reason", default="model swap", help="Maintenance lock reason")
 
@@ -428,7 +502,7 @@ def main(argv: list[str] | None = None) -> int:
                 target_model=args.to,
                 old_model=args.from_model,
                 keep_old=args.keep_old,
-                skip_pull=args.skip_pull,
+                pull_mode=args.pull_mode,
                 skip_probe=args.skip_probe,
                 reason=args.reason,
             )

@@ -209,18 +209,23 @@ Agent/script mode:
 ```bash
 aishaman status --json
 aishaman lock --gpu 1 --reason "model swap" --json
-aishaman swap --gpu 1 --to qwen3.5:latest --from-model gpt-oss:latest --json
+aishaman swap --gpu 1 --to qwen3.5:latest --from-model gpt-oss:latest --pull-mode auto --json
 aishaman unlock --gpu 1 --json
 ```
 
 The `swap` workflow performs:
 1. Maintenance lock
-2. Optional pull target model on backend
+2. Smart pull behavior on backend (`--pull-mode`):
+   - `auto` (default): check local models first, pull only if missing
+   - `always`: always pull
+   - `never`: never pull
 3. Optional delete old model on backend
 4. Optional probe call
 5. Unlock
 
 If a step fails, it attempts automatic unlock.
+
+Interactive mode prompts before downloading when `pull-mode` is `auto` and the model is missing.
 
 ## Rollback
 
