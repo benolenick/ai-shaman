@@ -179,6 +179,8 @@ class GpuGate:
         self.cfg = gpu_cfg
         self.semaphore = asyncio.Semaphore(gpu_cfg.max_concurrent)
         self.paused = False           # manual pause
+        self.maintenance_locked = False  # hard block during model swap/maintenance
+        self.maintenance_reason = ""
         self.temp_tripped = False     # auto-pause from temperature
         self.power_tripped = False    # auto-pause from combined power
         self.maintenance_locked = False  # hard block during model swap/maintenance
@@ -931,6 +933,32 @@ def make_gpu_app(gate: GpuGate, monitor: GpuMonitor, config: Config,
         path = request.path
         method = request.method
         gpu_stats = monitor.stats.get(gate.cfg.id)
+        if gate.maintenance_locked:
+            gate.total_requests += 1
+            gate.total_errors += 1
+            req_logger.log(
+                gate.cfg.name,
+                method,
+                path,
+                503,
+                0.0,
+                gpu_stats.power_w if gpu_stats else 0.0,
+                "",
+            )
+            return web.json_response({
+                "error": "GPU PORT LOCKED FOR MAINTENANCE",
+                "guardian": "ai-shaman",
+                "gpu": {
+                    "id": gate.cfg.id,
+                    "name": gate.cfg.name,
+                    "port": gate.cfg.listen_port,
+                },
+                "message": (
+                    "This GPU proxy is temporarily locked to prevent requests "
+                    "during model swap or maintenance."
+                ),
+                "reason": gate.maintenance_reason or "model swap in progress",
+            }, status=503)
 
         # Maintenance lock: hard block all traffic
         if gate.maintenance_locked:

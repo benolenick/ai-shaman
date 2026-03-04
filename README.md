@@ -44,7 +44,7 @@ Consumers (apps, agents, scripts)
 - **Blocked admin endpoints** -- `/api/pull`, `/api/delete`, `/api/create`, `/api/copy`, `/api/push` are blocked at the proxy to prevent VRAM thrashing.
 - **Transparent streaming** -- SSE and NDJSON responses proxied chunk-by-chunk. Consumers see no difference.
 - **Clean-output mode (non-stream JSON)** -- strips `reasoning` / `thinking` fields and de-dupes repeated sentence tails.
-- **Management API** (localhost-only) -- `/guardian/status`, `/guardian/metrics`, `/guardian/pause`, `/guardian/resume`
+- **Management API** (localhost-only) -- `/guardian/status`, `/guardian/metrics`, `/guardian/pause`, `/guardian/resume`, `/guardian/maintenance/lock`, `/guardian/maintenance/unlock`
 - **Full request logging** -- timestamp, GPU, model, HTTP status, latency, power draw at request time.
 - **nvidia-smi monitoring** -- polls every 3s with 10s timeout (won't hang if GPU driver locks up).
 - **Cross-platform** -- Linux and Windows (anywhere nvidia-smi and Python 3.10+ exist).
@@ -191,6 +191,43 @@ All endpoints on `127.0.0.1:11450` (localhost only):
 | `/guardian/metrics` | GET | Request counts, latency histograms, power history |
 | `/guardian/pause` | POST | Pause a GPU or all GPUs (`{"gpu_id": 0}` or empty for all) |
 | `/guardian/resume` | POST | Resume a paused GPU |
+| `/guardian/maintenance/lock` | POST | Hard-lock a GPU proxy port (or all) during model swap (`{"gpu_id": 1, "reason": "swap"}`) |
+| `/guardian/maintenance/unlock` | POST | Remove maintenance lock from a GPU proxy port (or all) |
+
+## Operator CLI (`aishaman`)
+
+`aishaman` supports both guided human use and automation-safe agent workflows.
+
+Human interactive mode:
+
+```bash
+aishaman
+```
+
+Agent/script mode:
+
+```bash
+aishaman status --json
+aishaman lock --gpu 1 --reason "model swap" --json
+aishaman swap --gpu 1 --to qwen3.5:latest --from-model gpt-oss:latest --pull-mode auto --json
+aishaman unlock --gpu 1 --json
+```
+
+The `swap` workflow performs:
+0. Preflight safety check (queue/circuit-breaker/lock/high-power guard)
+1. Maintenance lock
+2. Smart pull behavior on backend (`--pull-mode`):
+   - `auto` (default): check local models first, pull only if missing
+   - `always`: always pull
+   - `never`: never pull
+3. Optional delete old model on backend
+4. Optional probe call
+5. Unlock
+
+If a step fails, it attempts automatic unlock.
+If preflight blocks the swap, re-run with `--force` only when you intentionally want to override safety checks.
+
+Interactive mode prompts before downloading when `pull-mode` is `auto` and the model is missing.
 
 ## Rollback
 
