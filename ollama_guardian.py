@@ -69,6 +69,13 @@ class Config:
     # Resource guard — prevents OOM crashes that require physical power cycle
     resource_guard_enabled: bool = True
     ram_min_free_gb: float = 4.0         # system-wide RAM floor
+    # Proactive resource monitor thresholds (checked every monitor_interval_s)
+    ram_warn_gb: float = 8.0             # log warning when free RAM drops below this
+    ram_throttle_gb: float = 4.0         # pause all gates when below this
+    ram_emergency_gb: float = 2.0        # kill Ollama model loads when below this
+    vram_warn_mb: float = 3000.0         # log warning per-GPU
+    vram_throttle_mb: float = 1500.0     # pause gate for that GPU
+    vram_emergency_mb: float = 500.0     # unload models on that GPU
 
     @classmethod
     def from_file(cls, path: str) -> "Config":
@@ -99,6 +106,12 @@ class Config:
             bulk_slow_backoff_s=raw.get("bulk_slow_backoff_s", 5.0),
             resource_guard_enabled=raw.get("resource_guard_enabled", True),
             ram_min_free_gb=raw.get("ram_min_free_gb", 4.0),
+            ram_warn_gb=raw.get("ram_warn_gb", 8.0),
+            ram_throttle_gb=raw.get("ram_throttle_gb", 4.0),
+            ram_emergency_gb=raw.get("ram_emergency_gb", 2.0),
+            vram_warn_mb=raw.get("vram_warn_mb", 3000.0),
+            vram_throttle_mb=raw.get("vram_throttle_mb", 1500.0),
+            vram_emergency_mb=raw.get("vram_emergency_mb", 500.0),
         )
 
 
@@ -194,6 +207,7 @@ class GpuGate:
         self.maintenance_reason = ""
         self.temp_tripped = False     # auto-pause from temperature
         self.power_tripped = False    # auto-pause from combined power
+        self.resource_tripped = False # auto-pause from low RAM/VRAM
         self.maintenance_locked = False  # hard block during model swap/maintenance
         self.maintenance_reason = ""
         self.queue_depth = 0
@@ -212,7 +226,7 @@ class GpuGate:
     def clear_temp(self):
         if self.temp_tripped:
             self.temp_tripped = False
-            if not self.paused and not self.power_tripped and not self.maintenance_locked:
+            if not self.paused and not self.power_tripped and not self.resource_tripped and not self.maintenance_locked:
                 self._resume_event.set()
             logging.info(f"[{self.cfg.name}] Temp circuit breaker cleared")
 
@@ -225,7 +239,7 @@ class GpuGate:
     def clear_power(self):
         if self.power_tripped:
             self.power_tripped = False
-            if not self.paused and not self.temp_tripped and not self.maintenance_locked:
+            if not self.paused and not self.temp_tripped and not self.resource_tripped and not self.maintenance_locked:
                 self._resume_event.set()
             logging.info(f"[{self.cfg.name}] Power budget cleared")
 
@@ -236,9 +250,22 @@ class GpuGate:
 
     def manual_resume(self):
         self.paused = False
-        if not self.temp_tripped and not self.power_tripped and not self.maintenance_locked:
+        if not self.temp_tripped and not self.power_tripped and not self.resource_tripped and not self.maintenance_locked:
             self._resume_event.set()
         logging.info(f"[{self.cfg.name}] Manually resumed")
+
+    def trip_resource(self, reason: str = "low resources"):
+        if not self.resource_tripped:
+            self.resource_tripped = True
+            self._resume_event.clear()
+            logging.warning(f"[{self.cfg.name}] RESOURCE GUARD TRIPPED -- {reason}")
+
+    def clear_resource(self):
+        if self.resource_tripped:
+            self.resource_tripped = False
+            if not self.paused and not self.temp_tripped and not self.power_tripped and not self.maintenance_locked:
+                self._resume_event.set()
+            logging.info(f"[{self.cfg.name}] Resource guard cleared")
 
     def maintenance_lock(self, reason: str = ""):
         self.maintenance_locked = True
@@ -252,13 +279,13 @@ class GpuGate:
     def maintenance_unlock(self):
         self.maintenance_locked = False
         self.maintenance_reason = ""
-        if not self.paused and not self.temp_tripped and not self.power_tripped:
+        if not self.paused and not self.temp_tripped and not self.power_tripped and not self.resource_tripped:
             self._resume_event.set()
         logging.info(f"[{self.cfg.name}] Maintenance lock released")
 
     @property
     def is_blocked(self) -> bool:
-        return self.paused or self.temp_tripped or self.power_tripped or self.maintenance_locked
+        return self.paused or self.temp_tripped or self.power_tripped or self.resource_tripped or self.maintenance_locked
 
     async def acquire(self, timeout: float):
         """Wait for circuit breaker + semaphore. Raises TimeoutError."""
@@ -1239,6 +1266,7 @@ def make_management_app(gates: dict[int, GpuGate], monitor: GpuMonitor,
                 "is_blocked": gate.is_blocked,
                 "temp_tripped": gate.temp_tripped,
                 "power_tripped": gate.power_tripped,
+                "resource_tripped": gate.resource_tripped,
                 "paused": gate.paused,
                 "maintenance_locked": gate.maintenance_locked,
                 "maintenance_reason": gate.maintenance_reason,
@@ -1481,14 +1509,97 @@ def make_management_app(gates: dict[int, GpuGate], monitor: GpuMonitor,
 # Circuit Breaker Loop
 # ---------------------------------------------------------------------------
 
+def _read_free_ram_gb() -> float:
+    """Read available system RAM from /proc/meminfo. Returns -1.0 on failure."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024 * 1024)
+    except Exception:
+        pass
+    return -1.0
+
+
+async def _unload_ollama_models(backend_port: int, gpu_name: str):
+    """Ask Ollama to unload all loaded models by setting keep_alive=0."""
+    url = f"http://127.0.0.1:{backend_port}/api/ps"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status != 200:
+                    return
+                data = await resp.json()
+            models = data.get("models", [])
+            for m in models:
+                model_name = m.get("name", "")
+                if not model_name:
+                    continue
+                logging.warning(f"[{gpu_name}] EMERGENCY: unloading model {model_name}")
+                gen_url = f"http://127.0.0.1:{backend_port}/api/generate"
+                payload = {"model": model_name, "keep_alive": 0}
+                async with session.post(gen_url, json=payload,
+                                        timeout=aiohttp.ClientTimeout(total=10)) as _:
+                    pass
+    except Exception as e:
+        logging.error(f"[{gpu_name}] Failed to unload models: {e}")
+
+
 async def circuit_breaker_loop(gates: dict[int, GpuGate], monitor: GpuMonitor,
                                 config: Config):
-    """Continuously check GPU temps and power, trip/clear circuit breakers."""
+    """Continuously check GPU temps, power, RAM, and VRAM.
+
+    Three-tier escalation for resources:
+      WARN      — log warning, no action
+      THROTTLE  — pause gates (block new requests, running inference continues)
+      EMERGENCY — unload models from Ollama to free VRAM/RAM
+    """
+    # Track previous state to avoid log spam
+    ram_state = "ok"        # ok | warn | throttle | emergency
+    vram_state: dict[int, str] = {g.id: "ok" for g in config.gpus}
+
     while True:
         await asyncio.sleep(config.monitor_interval_s)
 
         combined = monitor.combined_power
 
+        # ----- System RAM check (affects ALL gates) -----
+        free_ram = _read_free_ram_gb()
+        if free_ram >= 0:
+            if free_ram < config.ram_emergency_gb:
+                if ram_state != "emergency":
+                    logging.critical(
+                        f"RESOURCE EMERGENCY: {free_ram:.1f}GB RAM free "
+                        f"(< {config.ram_emergency_gb}GB) — unloading all models"
+                    )
+                    ram_state = "emergency"
+                    for gcfg in config.gpus:
+                        gates[gcfg.id].trip_resource(f"RAM emergency: {free_ram:.1f}GB free")
+                        await _unload_ollama_models(gcfg.backend_port, gcfg.name)
+            elif free_ram < config.ram_throttle_gb:
+                if ram_state not in ("throttle", "emergency"):
+                    logging.warning(
+                        f"RESOURCE THROTTLE: {free_ram:.1f}GB RAM free "
+                        f"(< {config.ram_throttle_gb}GB) — pausing all gates"
+                    )
+                    ram_state = "throttle"
+                    for gcfg in config.gpus:
+                        gates[gcfg.id].trip_resource(f"RAM throttle: {free_ram:.1f}GB free")
+            elif free_ram < config.ram_warn_gb:
+                if ram_state != "warn":
+                    logging.warning(f"RESOURCE WARNING: {free_ram:.1f}GB RAM free (< {config.ram_warn_gb}GB)")
+                    ram_state = "warn"
+            else:
+                if ram_state != "ok":
+                    logging.info(f"RAM recovered: {free_ram:.1f}GB free")
+                    ram_state = "ok"
+                    # Only clear resource trip if all per-GPU VRAM is also ok
+                    all_vram_ok = all(v == "ok" for v in vram_state.values())
+                    if all_vram_ok:
+                        for gcfg in config.gpus:
+                            gates[gcfg.id].clear_resource()
+
+        # ----- Per-GPU checks -----
         for gcfg in config.gpus:
             gate = gates[gcfg.id]
             stats = monitor.stats.get(gcfg.id)
@@ -1501,12 +1612,40 @@ async def circuit_breaker_loop(gates: dict[int, GpuGate], monitor: GpuMonitor,
             elif stats.temp_c <= gcfg.temp_resume_c:
                 gate.clear_temp()
 
-            # VRAM warning
-            if stats.vram_free_mb < 2048 and stats.vram_free_mb > 0:
-                logging.warning(
-                    f"[{gcfg.name}] Low VRAM: {stats.vram_free_mb:.0f}MB free "
-                    f"of {stats.vram_total_mb:.0f}MB"
-                )
+            # VRAM escalation (per-GPU)
+            if stats.vram_free_mb > 0:
+                prev_vram = vram_state.get(gcfg.id, "ok")
+                if stats.vram_free_mb < config.vram_emergency_mb:
+                    if prev_vram != "emergency":
+                        logging.critical(
+                            f"[{gcfg.name}] VRAM EMERGENCY: {stats.vram_free_mb:.0f}MB free "
+                            f"(< {config.vram_emergency_mb:.0f}MB) — unloading models"
+                        )
+                        vram_state[gcfg.id] = "emergency"
+                        gate.trip_resource(f"VRAM emergency: {stats.vram_free_mb:.0f}MB free")
+                        await _unload_ollama_models(gcfg.backend_port, gcfg.name)
+                elif stats.vram_free_mb < config.vram_throttle_mb:
+                    if prev_vram not in ("throttle", "emergency"):
+                        logging.warning(
+                            f"[{gcfg.name}] VRAM THROTTLE: {stats.vram_free_mb:.0f}MB free "
+                            f"(< {config.vram_throttle_mb:.0f}MB) — pausing gate"
+                        )
+                        vram_state[gcfg.id] = "throttle"
+                        gate.trip_resource(f"VRAM throttle: {stats.vram_free_mb:.0f}MB free")
+                elif stats.vram_free_mb < config.vram_warn_mb:
+                    if prev_vram != "warn":
+                        logging.warning(
+                            f"[{gcfg.name}] Low VRAM: {stats.vram_free_mb:.0f}MB free "
+                            f"of {stats.vram_total_mb:.0f}MB"
+                        )
+                        vram_state[gcfg.id] = "warn"
+                else:
+                    if prev_vram != "ok":
+                        logging.info(f"[{gcfg.name}] VRAM recovered: {stats.vram_free_mb:.0f}MB free")
+                        vram_state[gcfg.id] = "ok"
+                        # Clear resource trip only if RAM is also ok
+                        if ram_state == "ok":
+                            gate.clear_resource()
 
         # Combined power circuit breaker (all GPUs)
         if combined >= config.combined_power_threshold_w:
