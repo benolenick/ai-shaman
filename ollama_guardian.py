@@ -48,6 +48,8 @@ class GpuConfig:
     temp_resume_c: float = 75.0
     power_limit_w: float = 200.0
     allowed_models: list[str] = field(default_factory=list)  # e.g. ["qwen3:*", "qwen2.5:*"]
+    vram_min_free_mb: float = 2000.0     # minimum free VRAM to accept requests (prevents OOM)
+    ram_min_free_gb: float = 4.0         # minimum free system RAM to accept requests
 
 
 @dataclass
@@ -64,6 +66,9 @@ class Config:
     job_result_ttl_s: float = 600.0      # how long to keep results in memory
     bulk_inter_job_delay_s: float = 2.0  # delay between bulk jobs
     bulk_slow_backoff_s: float = 5.0     # base backoff when Ollama is slow (>60s)
+    # Resource guard — prevents OOM crashes that require physical power cycle
+    resource_guard_enabled: bool = True
+    ram_min_free_gb: float = 4.0         # system-wide RAM floor
 
     @classmethod
     def from_file(cls, path: str) -> "Config":
@@ -73,8 +78,12 @@ class Config:
         gpus = []
         for g in gpu_dicts:
             allowed = g.pop("allowed_models", [])
+            vram_min = g.pop("vram_min_free_mb", 2000.0)
+            ram_min = g.pop("ram_min_free_gb", 4.0)
             gc = GpuConfig(**g)
             gc.allowed_models = allowed
+            gc.vram_min_free_mb = vram_min
+            gc.ram_min_free_gb = ram_min
             gpus.append(gc)
         return cls(
             gpus=gpus,
@@ -88,6 +97,8 @@ class Config:
             job_result_ttl_s=raw.get("job_result_ttl_s", 600.0),
             bulk_inter_job_delay_s=raw.get("bulk_inter_job_delay_s", 2.0),
             bulk_slow_backoff_s=raw.get("bulk_slow_backoff_s", 5.0),
+            resource_guard_enabled=raw.get("resource_guard_enabled", True),
+            ram_min_free_gb=raw.get("ram_min_free_gb", 4.0),
         )
 
 
@@ -1086,6 +1097,72 @@ def make_gpu_app(gate: GpuGate, monitor: GpuMonitor, config: Config,
                 req_logger.log(gate.cfg.name, method, path, 403, 0.0,
                                gpu_stats.power_w if gpu_stats else 0.0, model)
                 return web.json_response(rejection, status=403)
+        # ----------------------------------------------------------------------
+
+        # -- RESOURCE GUARD (prevents OOM crashes) -----------------------------
+        if method == "POST" and _is_queued(path) and config.resource_guard_enabled:
+            # Check VRAM
+            if gpu_stats and gpu_stats.vram_free_mb > 0:
+                if gpu_stats.vram_free_mb < gate.cfg.vram_min_free_mb:
+                    gate.total_requests += 1
+                    gate.total_errors += 1
+                    logging.warning(
+                        f"[{gate.cfg.name}] RESOURCE GUARD: VRAM too low "
+                        f"({gpu_stats.vram_free_mb:.0f}MB free < "
+                        f"{gate.cfg.vram_min_free_mb:.0f}MB minimum) -- "
+                        f"rejecting request to prevent OOM crash"
+                    )
+                    req_logger.log(gate.cfg.name, method, path, 503, 0.0,
+                                   gpu_stats.power_w, model)
+                    return web.json_response({
+                        "error": "RESOURCE GUARD: INSUFFICIENT VRAM",
+                        "guardian": "ai-shaman",
+                        "gpu": {
+                            "id": gate.cfg.id,
+                            "name": gate.cfg.name,
+                            "vram_free_mb": gpu_stats.vram_free_mb,
+                            "vram_total_mb": gpu_stats.vram_total_mb,
+                            "vram_min_free_mb": gate.cfg.vram_min_free_mb,
+                        },
+                        "message": (
+                            f"Request rejected to prevent OOM crash. "
+                            f"GPU {gate.cfg.id} has only {gpu_stats.vram_free_mb:.0f}MB "
+                            f"free VRAM (minimum: {gate.cfg.vram_min_free_mb:.0f}MB). "
+                            f"Wait for current workload to finish or reduce model size."
+                        ),
+                    }, status=503)
+
+            # Check system RAM
+            try:
+                with open("/proc/meminfo") as f:
+                    for line in f:
+                        if line.startswith("MemAvailable:"):
+                            avail_gb = int(line.split()[1]) / (1024 * 1024)
+                            if avail_gb < config.ram_min_free_gb:
+                                gate.total_requests += 1
+                                gate.total_errors += 1
+                                logging.warning(
+                                    f"[{gate.cfg.name}] RESOURCE GUARD: System RAM too low "
+                                    f"({avail_gb:.1f}GB free < {config.ram_min_free_gb:.1f}GB minimum) -- "
+                                    f"rejecting to prevent system freeze"
+                                )
+                                req_logger.log(gate.cfg.name, method, path, 503, 0.0,
+                                               gpu_stats.power_w if gpu_stats else 0.0, model)
+                                return web.json_response({
+                                    "error": "RESOURCE GUARD: INSUFFICIENT SYSTEM RAM",
+                                    "guardian": "ai-shaman",
+                                    "ram_free_gb": round(avail_gb, 1),
+                                    "ram_min_free_gb": config.ram_min_free_gb,
+                                    "message": (
+                                        f"Request rejected to prevent system freeze. "
+                                        f"Only {avail_gb:.1f}GB RAM available "
+                                        f"(minimum: {config.ram_min_free_gb:.1f}GB). "
+                                        f"Kill other processes or wait for memory to free."
+                                    ),
+                                }, status=503)
+                            break
+            except Exception:
+                pass  # /proc/meminfo not available (non-Linux) — skip check
         # ----------------------------------------------------------------------
 
         start_time = time.time()
